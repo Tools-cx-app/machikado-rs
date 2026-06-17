@@ -243,6 +243,24 @@ mod tests {
             },
         ]
     }
+
+    fn make_temp_module_dir() -> std::path::PathBuf {
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("machikado_sig_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        fs::write(dir.join("a.txt"), b"hello").unwrap();
+        fs::write(dir.join("sub/b.txt"), b"world").unwrap();
+        fs::write(dir.join("sig.txt"), b"signature_placeholder").unwrap();
+        dir
+    }
+
+    fn load_entries(dir: &std::path::Path, ignore_names: &[&str]) -> Vec<FileEntry> {
+        use crate::load_folder_files;
+        load_folder_files(dir, &[], ignore_names).unwrap()
+    }
+
     #[test]
     fn test_sign_and_verify_roundtrip() {
         let kp = generate_keypair();
@@ -493,23 +511,4 @@ mod tests {
         // Filtered signature verifies against filtered entries
         verify_signed_blob(&filtered, &sig_filtered).unwrap();
     }
-}
-
-#[cfg(test)]
-fn make_temp_module_dir() -> std::path::PathBuf {
-    use std::fs;
-    let dir = std::env::temp_dir().join(format!("machikado_sig_test_{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    fs::create_dir_all(dir.join("sub")).unwrap();
-    fs::write(dir.join("a.txt"), b"hello").unwrap();
-    fs::write(dir.join("sub/b.txt"), b"world").unwrap();
-    fs::write(dir.join("sig.txt"), b"signature_placeholder").unwrap();
-    dir
-}
-
-#[cfg(test)]
-fn load_entries(dir: &std::path::Path, ignore_names: &[&str]) -> Vec<FileEntry> {
-    use crate::load_folder_files;
-    load_folder_files(dir, &[], ignore_names).unwrap()
 }
