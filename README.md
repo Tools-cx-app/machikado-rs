@@ -34,16 +34,21 @@ std::fs::write("member_pk", member_kp.public_key)?;
 ```rust
 use machikado_rs::{load_folder_files, sign_file_entries, sign_mazoku};
 
+// Read keys from disk (or from CI secrets, env vars, etc.)
+let member_sk: [u8; 64] = std::fs::read("keys/member_sk")?.try_into().unwrap();
+let member_pk: [u8; 32] = std::fs::read("keys/member_pk")?.try_into().unwrap();
+let org_sk:    [u8; 64] = std::fs::read("keys/org_sk")?.try_into().unwrap();
+
 // Load module files, skip .git directory
 let entries = load_folder_files(&module_dir, &[".git"], &[])?;
 
 // Sign files with member key → machikado (96 bytes)
-let machikado = sign_file_entries(&entries, &member_sk)?;
+let machikado: Vec<u8> = sign_file_entries(&entries, &member_sk)?;
 std::fs::write(module_dir.join("machikado"), &machikado)?;
 
 // Sign env + member_pk with org key → mazoku (96 bytes)
-let env = b"my_secret_env_string";  // arbitrary data, e.g. from CI secrets
-let mazoku = sign_mazoku(env, &member_pk, &org_sk)?;
+let env: &[u8] = b"my_secret_env_string";  // arbitrary data, e.g. from CI secrets
+let mazoku: Vec<u8> = sign_mazoku(env, &member_pk, &org_sk)?;
 std::fs::write(module_dir.join("mazoku"), &mazoku)?;
 ```
 
@@ -52,9 +57,9 @@ std::fs::write(module_dir.join("mazoku"), &mazoku)?;
 ```rust
 use machikado_rs::{load_folder_files, verify_full};
 
-let machikado = std::fs::read("module/machikado")?;
-let mazoku    = std::fs::read("module/mazoku")?;
-let env = b"my_secret_env_string";  // same arbitrary data, hardcoded in module source
+let machikado: Vec<u8> = std::fs::read("module/machikado")?;
+let mazoku:    Vec<u8> = std::fs::read("module/mazoku")?;
+let env: &[u8] = env!("MAZOKU_SECRET_TEXT").as_bytes();  // baked in at compile time
 
 // Load module files, excluding signature files themselves
 let entries = load_folder_files(&module_dir, &[".git"], &["machikado", "mazoku"])?;
