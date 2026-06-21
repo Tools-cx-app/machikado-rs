@@ -15,10 +15,18 @@ use crate::sign::FileEntry;
 /// # Example
 ///
 /// ```ignore
+/// // Single mapping (most concise)
+/// let mapping = FileMapping::from(("bin/zygiskd64", "bin/arm64-v8a/zygiskd"));
+///
+/// // Multiple mappings
+/// let mapping = FileMapping::from([
+///     ("bin/zygiskd64", "bin/arm64-v8a/zygiskd"),
+///     ("lib/libzygisk.so", "lib/armeabi-v7a/libzygisk.so"),
+/// ]);
+///
+/// // Builder style (still available)
 /// let mut mapping = FileMapping::new();
-/// // final path ← source path
 /// mapping.insert("bin/zygiskd64", "bin/arm64-v8a/zygiskd");
-/// mapping.insert("lib/libzygisk.so", "lib/armeabi-v7a/libzygisk.so");
 /// ```
 #[derive(Debug, Clone, Default)]
 pub struct FileMapping {
@@ -50,6 +58,38 @@ impl FileMapping {
     /// Whether the mapping is empty.
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
+    }
+}
+
+// ── Convenience constructors ───────────────────────────────────────
+
+impl From<(&str, &str)> for FileMapping {
+    /// Create a mapping from a single `(target_path, source_path)` pair.
+    fn from((target, source): (&str, &str)) -> Self {
+        let mut m = Self::new();
+        m.insert(target, source);
+        m
+    }
+}
+
+impl<const N: usize> From<[(&str, &str); N]> for FileMapping {
+    /// Create a mapping from a fixed-size array of `(target_path, source_path)` pairs.
+    fn from(pairs: [(&str, &str); N]) -> Self {
+        let mut m = Self::new();
+        for (target, source) in pairs {
+            m.insert(target, source);
+        }
+        m
+    }
+}
+
+impl FromIterator<(String, String)> for FileMapping {
+    fn from_iter<I: IntoIterator<Item = (String, String)>>(iter: I) -> Self {
+        let mut m = Self::new();
+        for (target, source) in iter {
+            m.insert(&target, &source);
+        }
+        m
     }
 }
 
@@ -280,6 +320,38 @@ mod tests {
 
         // Source path bin/arm64-v8a/zygiskd must not appear (mapping covers it)
         assert_eq!(paths, vec!["bin/zygiskd64", "module.prop"]);
+    }
+
+    #[test]
+    fn test_mapping_from_single_pair() {
+        let m = FileMapping::from(("bin/foo", "bin/arm64-v8a/foo"));
+        assert_eq!(m.len(), 1);
+        assert!(!m.is_empty());
+    }
+
+    #[test]
+    fn test_mapping_from_array() {
+        let m = FileMapping::from([
+            ("bin/zygiskd64", "bin/arm64-v8a/zygiskd"),
+            ("bin/zygiskd32", "bin/armeabi-v7a/zygiskd"),
+        ]);
+        assert_eq!(m.len(), 2);
+    }
+
+    #[test]
+    fn test_mapping_from_iterator() {
+        let pairs = vec![
+            ("a.txt".to_string(), "src/a.txt".to_string()),
+            ("b.txt".to_string(), "src/b.txt".to_string()),
+        ];
+        let m: FileMapping = pairs.into_iter().collect();
+        assert_eq!(m.len(), 2);
+    }
+
+    #[test]
+    fn test_mapping_from_empty_array() {
+        let m = FileMapping::from([]);
+        assert!(m.is_empty());
     }
 
     /// RAII guard to clean up temp dir on drop
