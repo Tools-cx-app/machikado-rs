@@ -40,7 +40,7 @@ let member_pk: [u8; 32] = std::fs::read("keys/member_pk")?.try_into().unwrap();
 let org_sk:    [u8; 64] = std::fs::read("keys/org_sk")?.try_into().unwrap();
 
 // Load module files, skip .git directory
-let entries = load_folder_files(&module_dir, &[".git"], &[])?;
+let entries = load_folder_files(&module_dir, &[".git"], &[], None)?;
 
 // Sign files with member key → machikado (96 bytes)
 let machikado: Vec<u8> = sign_file_entries(&entries, &member_sk)?;
@@ -62,7 +62,7 @@ let mazoku:    Vec<u8> = std::fs::read("module/mazoku")?;
 let env: &[u8] = env!("MAZOKU_SECRET_TEXT").as_bytes();  // baked in at compile time
 
 // Load module files, excluding signature files themselves
-let entries = load_folder_files(&module_dir, &[".git"], &["machikado", "mazoku"])?;
+let entries = load_folder_files(&module_dir, &[".git"], &["machikado", "mazoku"], None)?;
 
 // Two-tier verification: mazoku first, then machikado
 verify_full(&machikado, &mazoku, &entries, env)?;
@@ -97,34 +97,51 @@ verify_full(machikado, mazoku, entries, env)
 | `verify_mazoku(blob, env, member_pk)` | Verify mazoku blob |
 | `verify_full(machikado, mazoku, entries, env)` | Two-tier verification |
 | `load_folder_files(dir, ignore_prefixes, ignore_names, mapping)` | Load + sort files from directory |
-| `FileMapping::new()` | Create an empty file mapping |
-| `FileMapping::insert(target, source)` | Map final path ← source path |
+| `FileMapping::from((target, source))` | Create a mapping from a single pair |
+| `FileMapping::from([(t1,s1), (t2,s2)])` | Create a mapping from an array of pairs |
+| `FileMapping::new()` | Create an empty file mapping (builder style) |
+| `FileMapping::insert(target, source)` | Add a mapping entry |
 
 ### File mapping
 
-Some Magisk modules use `customize.sh` to move architecture-specific files to generic
-paths during installation (e.g. `bin/arm64-v8a/zygiskd` → `bin/zygiskd64`).
-To keep the signature valid after such relocation, use `FileMapping` to tell the
-signer about the final paths:
+`FileMapping` decouples the path used in the signature from the file's physical
+location. Two common scenarios:
+
+**Scenario A — Signing with arch-specific sources (build time):**
+`customize.sh` will move `bin/arm64-v8a/zygiskd` to `bin/zygiskd64` at install
+ time. Sign against the final path so verification on device matches:
 
 ```rust
-use machikado_rs::{FileMapping, load_folder_files, sign_file_entries};
+use machikado_rs::FileMapping;
 
-let mut mapping = FileMapping::new();
-// final path ← source path
-mapping.insert("bin/zygiskd64", "bin/arm64-v8a/zygiskd");
-mapping.insert("bin/zygiskd32", "bin/armeabi-v7a/zygiskd");
-mapping.insert("lib/libzygisk.so", "lib/armeabi-v7a/libzygisk.so");
-mapping.insert("lib64/libzygisk.so", "lib/arm64-v8a/libzygisk.so");
-
+let mapping = FileMapping::from(("bin/zygiskd64", "bin/arm64-v8a/zygiskd"));
 let entries = load_folder_files(&module_dir, &[".git"], &[], Some(&mapping))?;
-let machikado = sign_file_entries(&entries, &member_sk)?;
 ```
 
-- Mapped files use the **final path** as `relative_path` for sorting & signing.
-- Unmapped files are loaded as-is from the directory.
-- Source paths covered by the mapping are excluded from the directory walk
-  (no duplicates).
+**Scenario B — Verifying when the original file was renamed (device side):**
+`customize.sh` backed up `module.prop` as `module.prop.orig` and the active
+`module.prop` may have changed. Verify against the backup:
+
+```rust
+let mapping = FileMapping::from(("module.prop", "module.prop.orig"));
+let entries = load_folder_files(&module_dir, &[], &["machikado", "mazoku"], Some(&mapping))?;
+```
+
+Multiple pairs can be passed as an array or collected from an iterator:
+
+```rust
+let mapping = FileMapping::from([
+    ("bin/zygiskd64", "bin/arm64-v8a/zygiskd"),
+    ("bin/zygiskd32", "bin/armeabi-v7a/zygiskd"),
+]);
+
+// Builder style still works:
+let mut mapping = FileMapping::new();
+mapping.insert("bin/zygiskd64", "bin/arm64-v8a/zygiskd");
+```
+
+- `insert(target, source)`: `target` = path used in signature, `source` = physical file.
+- Both target and source paths are excluded from the directory walk (no duplicates).
 - Pass `None` to skip mapping entirely (same behavior as before).
 
 ## Signing Protocol
