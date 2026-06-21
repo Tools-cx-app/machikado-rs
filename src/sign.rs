@@ -511,4 +511,84 @@ mod tests {
         // Filtered signature verifies against filtered entries
         verify_signed_blob(&filtered, &sig_filtered).unwrap();
     }
+
+    /// End-to-end test mirroring the user's exact scenario:
+    /// 1. Sign without mapping (like xtask build), ignoring customize.sh & mazoku
+    /// 2. Simulate customize.sh: cp module.prop → module.prop.orig, rm customize.sh
+    /// 3. Modify module.prop (simulating Magisk)
+    /// 4. Write machikado + mazoku to disk
+    /// 5. Verify with mapping (\"module.prop\", \"module.prop.orig\"), ignoring machikado & mazoku
+    #[test]
+    fn test_user_scenario_module_prop_backup() {
+        use crate::{FileMapping, load_folder_files};
+        use std::fs;
+
+        let member_kp = generate_keypair();
+
+        // ── 1. Set up source directory (like module/ before build) ──
+        let dir = std::env::temp_dir().join(format!("machikado_user_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(dir.join("webroot")).unwrap();
+
+        fs::write(
+            dir.join("module.prop"),
+            b"id=test\nname=Test\nversion=v1.0\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("customize.sh"),
+            b"#!/bin/sh\ncp module.prop module.prop.orig\n",
+        )
+        .unwrap();
+        fs::write(dir.join("config.toml"), b"key = \"value\"\n").unwrap();
+        fs::write(dir.join("webroot/index.html"), b"<html></html>\n").unwrap();
+
+        // ── 2. Sign: like xtask build (no mapping, ignore customize.sh & mazoku) ──
+        let entries_sign = load_folder_files(&dir, &[], &["customize.sh", "mazoku"], None).unwrap();
+        assert!(!entries_sign.is_empty());
+        let machikado = sign_file_entries(&entries_sign, &member_kp.private_key).unwrap();
+
+        // ── 3. Simulate customize.sh: backup module.prop, delete customize.sh ──
+        fs::copy(dir.join("module.prop"), dir.join("module.prop.orig")).unwrap();
+        fs::remove_file(dir.join("customize.sh")).ok();
+
+        // ── 4. Simulate Magisk modifying module.prop ──
+        fs::write(
+            dir.join("module.prop"),
+            b"id=test\nname=Test (NXT)\nversion=v1.0\n",
+        )
+        .unwrap();
+
+        // ── 5. Write machikado to disk ──
+        fs::write(dir.join("machikado"), &machikado).unwrap();
+
+        // ── 6. Verify: like misc.rs (mapping module.prop ← module.prop.orig, ignore machikado & mazoku) ──
+        let mapping = FileMapping::from(("module.prop", "module.prop.orig"));
+        let entries_verify =
+            load_folder_files(&dir, &[], &["machikado", "mazoku"], Some(&mapping)).unwrap();
+
+        // The entries should be identical (same count, same paths in same order)
+        assert_eq!(
+            entries_verify.len(),
+            entries_sign.len(),
+            "verify entries count differs from sign entries count"
+        );
+
+        for (s, v) in entries_sign.iter().zip(entries_verify.iter()) {
+            assert_eq!(
+                s.relative_path, v.relative_path,
+                "path mismatch: sign='{}' vs verify='{}'",
+                s.relative_path, v.relative_path
+            );
+            assert_eq!(
+                s.content, v.content,
+                "content mismatch for '{}'",
+                s.relative_path
+            );
+        }
+
+        // Full machikado verification should pass
+        verify_signed_blob(&entries_verify, &machikado).unwrap();
+    }
 }
