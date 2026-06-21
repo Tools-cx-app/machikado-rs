@@ -160,9 +160,9 @@ pub fn load_folder_files(
             .to_string_lossy()
             .replace('\\', "/");
 
-        // Skip source paths already covered by the mapping
+        // Skip paths already covered by the mapping (both source and target)
         if let Some(m) = mapping
-            && m.map.values().any(|s| s == &relative_path)
+            && (m.map.values().any(|s| s == &relative_path) || m.map.contains_key(&relative_path))
         {
             continue;
         }
@@ -352,6 +352,27 @@ mod tests {
     fn test_mapping_from_empty_array() {
         let m = FileMapping::from([]);
         assert!(m.is_empty());
+    }
+
+    #[test]
+    fn test_mapping_target_exists_on_disk_no_duplicate() {
+        let dir = temp_dir();
+        let _guard = Cleanup(Some(dir.clone()));
+
+        // Both the target and source physically exist — like module.prop and
+        // module.prop.orig after customize.sh copies the original.
+        write_file(&dir, "module.prop", b"modified");
+        write_file(&dir, "module.prop.orig", b"original");
+
+        let mapping = FileMapping::from(("module.prop", "module.prop.orig"));
+
+        let entries = load_folder_files(&dir, &[], &[], Some(&mapping)).unwrap();
+        let paths: Vec<&str> = entries.iter().map(|e| e.relative_path.as_str()).collect();
+        let contents: Vec<&[u8]> = entries.iter().map(|e| e.content.as_slice()).collect();
+
+        // Only one "module.prop" entry, with content from .orig
+        assert_eq!(paths, vec!["module.prop"]);
+        assert_eq!(contents, vec![b"original" as &[u8]]);
     }
 
     /// RAII guard to clean up temp dir on drop
