@@ -97,16 +97,6 @@ relative_path ‖ 0x00 ‖ file_size(LE u64) ‖ file_content
 
 Accumulated in lexicographic order, signed once.
 
-## AI based
-
-The project was originally written using AI. If you have a cleanliness obsession, please don't use this.
-
-| Version | TODO |
-|---------|------|
-| Since v0.0.x | Mostly AI-generated, with a small part done manually |
-| Since v0.1.x | Replace the AI parts with handmade ones as much as possible |
-| Since v1.x.x | Major overhaul, ditching the AI part |
-
 ## License
 
 * [Apache 2.0 license](https://www.apache.org/licenses/LICENSE-2.0)
