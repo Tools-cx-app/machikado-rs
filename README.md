@@ -1,159 +1,101 @@
 # machikado-rs
 
-ED25519 signing library for the Machikado Mazoku module ecosystem.
-Provides two-tier signature verification: **machikado** (file-level) and **mazoku** (org authorization).
+ED25519 signing for the Machikado Mazoku module ecosystem.
+Two-tier: **machikado** (files) + **mazoku** (org auth).
 
 ## Concepts
 
 | Term | Description |
 |------|-------------|
-| **org key** | Organization-level key pair. The org authorizes member/project keys via mazoku. |
-| **member key** | Member/project-level key pair. Used to sign module files (machikado). |
-| **machikado** | 96-byte blob: signature(64) + member_public_key(32). Signs all files in a module directory. |
-| **mazoku** | 96-byte blob: signature(64) + org_public_key(32). Signs `env_content` + `member_public_key`. |
+| **org key** | Organization key pair. Authorizes members via mazoku. |
+| **member key** | Project key pair. Signs module files (machikado). |
+| **machikado** | 96 bytes: `signature(64) ‖ member_pk(32)`. |
+| **mazoku** | 96 bytes: `signature(64) ‖ org_pk(32)`, over `env ‖ member_pk`. |
 
 ## Usage
 
-### Generate keys (one-time setup)
+### Generate keys
 
 ```rust
 use machikado_rs::generate_keypair;
 
-let org_kp = generate_keypair();     // org key pair
-let member_kp = generate_keypair();  // member key pair
+let org_kp = generate_keypair();
+let member_kp = generate_keypair();
 
-// Save keys (keep private keys secret!)
 std::fs::write("org_sk", org_kp.private_key)?;
-std::fs::write("org_pk", org_kp.public_key)?;
 std::fs::write("member_sk", member_kp.private_key)?;
-std::fs::write("member_pk", member_kp.public_key)?;
 ```
 
-### Build-time: sign module (xtask/CI)
+### Sign (build time)
 
 ```rust
 use machikado_rs::{load_folder_files, sign_file_entries, sign_mazoku};
 
-// Read keys from disk (or from CI secrets, env vars, etc.)
-let member_sk: [u8; 64] = std::fs::read("keys/member_sk")?.try_into().unwrap();
-let member_pk: [u8; 32] = std::fs::read("keys/member_pk")?.try_into().unwrap();
-let org_sk:    [u8; 64] = std::fs::read("keys/org_sk")?.try_into().unwrap();
-
-// Load module files, skip .git directory
 let entries = load_folder_files(&module_dir, &[".git"], &[], None)?;
 
-// Sign files with member key → machikado (96 bytes)
-let machikado: Vec<u8> = sign_file_entries(&entries, &member_sk)?;
-std::fs::write(module_dir.join("machikado"), &machikado)?;
+let machikado = sign_file_entries(&entries, &member_sk)?;
+std::fs::write(module_dir.join("machikado"), machikado.as_bytes())?;
 
-// Sign env + member_pk with org key → mazoku (96 bytes)
-let env: &[u8] = b"my_secret_env_string";  // arbitrary data, e.g. from CI secrets
-let mazoku: Vec<u8> = sign_mazoku(env, &member_pk, &org_sk)?;
-std::fs::write(module_dir.join("mazoku"), &mazoku)?;
+let mazoku = sign_mazoku(b"secret", &member_pk, &org_sk)?;
+std::fs::write(module_dir.join("mazoku"), mazoku.as_bytes())?;
 ```
 
-### Verify-time: device-side check
+### Verify (device side)
 
 ```rust
-use machikado_rs::{load_folder_files, verify_full};
+use machikado_rs::{load_folder_files, verify};
 
-let machikado: Vec<u8> = std::fs::read("module/machikado")?;
-let mazoku:    Vec<u8> = std::fs::read("module/mazoku")?;
-let env: &[u8] = env!("MAZOKU_SECRET_TEXT").as_bytes();  // baked in at compile time
+let entries = load_folder_files(&dir, &[], &["machikado", "mazoku"], None)?;
+let machikado = std::fs::read(dir.join("machikado"))?;
+let mazoku = std::fs::read(dir.join("mazoku"))?;
 
-// Load module files, excluding signature files themselves
-let entries = load_folder_files(&module_dir, &[".git"], &["machikado", "mazoku"], None)?;
-
-// Two-tier verification: mazoku first, then machikado
-verify_full(&machikado, &mazoku, &entries, env)?;
-// → Ok: module is trusted
+let (ok, _) = verify(&machikado, &mazoku, &entries, b"secret");
+assert!(ok);
 ```
-
-### Verification flow
-
-```
-verify_full(machikado, mazoku, entries, env)
-  │
-  ├─ 1. Extract member_pk from machikado blob tail
-  │
-  ├─ 2. verify_mazoku(mazoku, env, member_pk)
-  │      Extract org_pk from mazoku tail
-  │      Verify signature over (env ‖ member_pk)
-  │      → fails if org didn't authorize this member key
-  │
-  └─ 3. verify_signed_blob(entries, machikado)
-         Verify signature over file data (ZygiskNext protocol)
-         → fails if files were tampered
-```
-
-## API Reference
-
-| Function | Description |
-|----------|-------------|
-| `generate_keypair()` | Generate random ED25519 key pair |
-| `sign_file_entries(entries, member_sk)` | Sign file list → 96-byte machikado blob |
-| `verify_signed_blob(entries, blob)` | Verify machikado blob against file list |
-| `sign_mazoku(env, member_pk, org_sk)` | Sign env + member_pk → 96-byte mazoku blob |
-| `verify_mazoku(blob, env, member_pk)` | Verify mazoku blob |
-| `verify_full(machikado, mazoku, entries, env)` | Two-tier verification |
-| `load_folder_files(dir, ignore_prefixes, ignore_names, mapping)` | Load + sort files from directory |
-| `FileMapping::from((target, source))` | Create a mapping from a single pair |
-| `FileMapping::from([(t1,s1), (t2,s2)])` | Create a mapping from an array of pairs |
-| `FileMapping::new()` | Create an empty file mapping (builder style) |
-| `FileMapping::insert(target, source)` | Add a mapping entry |
 
 ### File mapping
 
-`FileMapping` decouples the path used in the signature from the file's physical
-location. Two common scenarios:
-
-**Scenario A — Signing with arch-specific sources (build time):**
-`customize.sh` will move `bin/arm64-v8a/zygiskd` to `bin/zygiskd64` at install
- time. Sign against the final path so verification on device matches:
+Map source paths to signed paths — for when `customize.sh` moves files at install time.
 
 ```rust
 use machikado_rs::FileMapping;
 
+// Arch-specific → generic
 let mapping = FileMapping::from(("bin/zygiskd64", "bin/arm64-v8a/zygiskd"));
-let entries = load_folder_files(&module_dir, &[".git"], &[], Some(&mapping))?;
-```
 
-**Scenario B — Verifying when the original file was renamed (device side):**
-`customize.sh` backed up `module.prop` as `module.prop.orig` and the active
-`module.prop` may have changed. Verify against the backup:
-
-```rust
+// Backup → original (for verification after Magisk modifies files)
 let mapping = FileMapping::from(("module.prop", "module.prop.orig"));
-let entries = load_folder_files(&module_dir, &[], &["machikado", "mazoku"], Some(&mapping))?;
-```
 
-Multiple pairs can be passed as an array or collected from an iterator:
-
-```rust
+// Multiple pairs
 let mapping = FileMapping::from([
     ("bin/zygiskd64", "bin/arm64-v8a/zygiskd"),
     ("bin/zygiskd32", "bin/armeabi-v7a/zygiskd"),
 ]);
 
-// Builder style still works:
-let mut mapping = FileMapping::new();
-mapping.insert("bin/zygiskd64", "bin/arm64-v8a/zygiskd");
+let entries = load_folder_files(&dir, &[], &[], Some(&mapping))?;
 ```
 
-- `insert(target, source)`: `target` = path used in signature, `source` = physical file.
-- Both target and source paths are excluded from the directory walk (no duplicates).
-- Pass `None` to skip mapping entirely (same behavior as before).
+## API
 
-## Signing Protocol
+| Function | Returns |
+|----------|---------|
+| `generate_keypair()` | `Ed25519KeyPair` |
+| `sign_file_entries(&[FileEntry], &[u8; 64])` | `Result<SignedBlob, SignError>` |
+| `sign_mazoku(&[u8], &[u8; 32], &[u8; 64])` | `Result<SignedBlob, SignError>` |
+| `verify(&[u8], &[u8], &[FileEntry], &[u8])` | `(bool, Option<SignError>)` |
+| `load_folder_files(&Path, &[&str], &[&str], Option<&FileMapping>)` | `io::Result<Vec<FileEntry>>` |
 
-Each file contributes to the signed data as:
+`SignedBlob` is a 96-byte newtype with `.as_bytes()`, `.to_vec()`, `.signature()`, `.public_key()`.
+
+## Signing protocol
+
+Compatible with ZygiskNext. Each file feeds into the signature as:
 
 ```
 relative_path ‖ 0x00 ‖ file_size(LE u64) ‖ file_content
 ```
 
-All files are accumulated in sorted order (lexicographic by path with `/` separator),
-then signed as a single ED25519 signature. This is compatible with ZygiskNext.
+Accumulated in lexicographic order, signed once.
 
 ## AI based
 

@@ -1,12 +1,7 @@
-//! ED25519 signing & verification.
-//!
-//! Signing protocol is compatible with ZygiskNext.
-//! For each file, the following is fed into the signature:
-//!   filename, then 0x00, then file_size as LE u64, then file_content.
-//! All file data is accumulated and signed once.
-//! Returns a 96-byte blob: signature (64 bytes) followed by public key (32 bytes).
+//! ED25519 signing & verification compatible with ZygiskNext.
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use thiserror::Error;
 
 use crate::key::{PrivateKey, PublicKey};
 
@@ -19,37 +14,76 @@ pub struct FileEntry {
     pub content: Vec<u8>,
 }
 
-/// Signature result: 96 bytes = signature(64) followed by public_key(32).
+/// A 96-byte signed blob: Ed25519 signature (64 bytes) followed by public key (32 bytes).
 ///
-/// Can be written directly to a machikado file.
-pub type SignedBlob = Vec<u8>;
-
-/// Signing/verification error.
-#[derive(Debug)]
-pub enum SignError {
-    InvalidPrivateKey,
-    InvalidBlob,
-    VerificationFailed,
+/// Use [`SignedBlob::as_bytes`] or [`SignedBlob::to_vec`] to serialize for writing to disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedBlob {
+    signature: [u8; 64],
+    public_key: [u8; 32],
 }
 
-impl std::fmt::Display for SignError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SignError::InvalidPrivateKey => write!(f, "invalid private key bytes"),
-            SignError::InvalidBlob => write!(f, "invalid signed blob (expected 96 bytes)"),
-            SignError::VerificationFailed => write!(f, "signature verification failed"),
+impl SignedBlob {
+    /// Create from a 64-byte signature and 32-byte public key.
+    pub fn new(signature: &[u8; 64], public_key: &[u8; 32]) -> Self {
+        Self {
+            signature: *signature,
+            public_key: *public_key,
         }
+    }
+
+    /// Parse from raw bytes. Fails if not exactly 96 bytes.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, SignError> {
+        if bytes.len() != 96 {
+            return Err(SignError::InvalidBlob);
+        }
+        let mut signature = [0u8; 64];
+        let mut public_key = [0u8; 32];
+        signature.copy_from_slice(&bytes[..64]);
+        public_key.copy_from_slice(&bytes[64..]);
+        Ok(Self {
+            signature,
+            public_key,
+        })
+    }
+
+    /// The 64-byte Ed25519 signature.
+    pub fn signature(&self) -> &[u8; 64] {
+        &self.signature
+    }
+
+    /// The 32-byte Ed25519 public key.
+    pub fn public_key(&self) -> &[u8; 32] {
+        &self.public_key
+    }
+
+    /// The raw 96 bytes as a flat array.
+    pub fn as_bytes(&self) -> [u8; 96] {
+        let mut bytes = [0u8; 96];
+        bytes[..64].copy_from_slice(&self.signature);
+        bytes[64..].copy_from_slice(&self.public_key);
+        bytes
+    }
+
+    /// Convert to an owned `Vec<u8>` (useful for mutation or FFI).
+    pub fn to_vec(&self) -> Vec<u8> {
+        self.as_bytes().to_vec()
     }
 }
 
-impl std::error::Error for SignError {}
+#[derive(Debug, PartialEq, Error)]
+pub enum SignError {
+    #[error("invalid private key bytes")]
+    InvalidPrivateKey,
+    #[error("invalid signed blob (expected 96 bytes)")]
+    InvalidBlob,
+    #[error("signature verification failed")]
+    VerificationFailed,
+}
 
-/// Sign file entries, returning a 96-byte blob.
+/// Sign file entries, returning a 96-byte [`SignedBlob`].
 ///
 /// The caller must ensure `entries` is sorted by relative path.
-/// Signing protocol: for each entry, concatenate
-/// `relative_path`, `0x00`, `content.len().to_le_bytes()`, `content`,
-/// accumulate, then sign once.
 ///
 /// # Example
 ///
@@ -69,54 +103,51 @@ pub fn sign_file_entries(
     let data = build_signing_data(entries);
     let signature = signing_key.sign(&data);
 
-    // 96 bytes = signature(64) || public_key(32)
-    let mut blob = Vec::with_capacity(96);
-    blob.extend_from_slice(&signature.to_bytes());
-    blob.extend_from_slice(&public_key);
-    Ok(blob)
+    Ok(SignedBlob::new(&signature.to_bytes(), &public_key))
 }
 
-/// Verify a 96-byte signed blob.
+/// Two-tier verification: mazoku (org authorization) → machikado (file integrity).
 ///
-/// Extracts the public key from the last 32 bytes of the blob.
-///
-/// # Example
-///
-/// ```ignore
-/// let blob = std::fs::read("machikado")?;
-/// let entries = machikado_rs::load_folder_files(module_dir, &[".git"], &["machikado", "mazoku"])?;
-/// machikado_rs::verify_signed_blob(&entries, &blob)?;
-/// ```
-pub fn verify_signed_blob(entries: &[FileEntry], signed_blob: &[u8]) -> Result<(), SignError> {
-    if signed_blob.len() != 96 {
-        return Err(SignError::InvalidBlob);
+/// Returns `(true, None)` on success, `(false, Some(err))` on failure.
+pub fn verify(
+    machikado_blob: &[u8],
+    mazoku_blob: &[u8],
+    entries: &[FileEntry],
+    env_content: &[u8],
+) -> (bool, Option<SignError>) {
+    let machikado = match SignedBlob::from_bytes(machikado_blob) {
+        Ok(b) => b,
+        Err(e) => return (false, Some(e)),
+    };
+
+    let mazoku = match SignedBlob::from_bytes(mazoku_blob) {
+        Ok(b) => b,
+        Err(e) => return (false, Some(e)),
+    };
+    let mazoku_sig = Signature::from_bytes(mazoku.signature());
+    let Ok(org_key) = VerifyingKey::from_bytes(mazoku.public_key()) else {
+        return (false, Some(SignError::VerificationFailed));
+    };
+    let mut mazoku_data = Vec::with_capacity(env_content.len() + 32);
+    mazoku_data.extend_from_slice(env_content);
+    mazoku_data.extend_from_slice(machikado.public_key());
+    if org_key.verify(&mazoku_data, &mazoku_sig).is_err() {
+        return (false, Some(SignError::VerificationFailed));
     }
 
-    // First 64 bytes = signature, last 32 bytes = public key
-    let signature_bytes: &[u8; 64] = signed_blob[..64]
-        .try_into()
-        .map_err(|_| SignError::InvalidBlob)?;
-    let public_key_bytes: &[u8; 32] = signed_blob[64..]
-        .try_into()
-        .map_err(|_| SignError::InvalidBlob)?;
+    let machikado_sig = Signature::from_bytes(machikado.signature());
+    let Ok(member_key) = VerifyingKey::from_bytes(machikado.public_key()) else {
+        return (false, Some(SignError::VerificationFailed));
+    };
+    let file_data = build_signing_data(entries);
+    if member_key.verify(&file_data, &machikado_sig).is_err() {
+        return (false, Some(SignError::VerificationFailed));
+    }
 
-    let signature = Signature::from_bytes(signature_bytes);
-    let verifying_key =
-        VerifyingKey::from_bytes(public_key_bytes).map_err(|_| SignError::VerificationFailed)?;
-
-    let data = build_signing_data(entries);
-    verifying_key
-        .verify(&data, &signature)
-        .map_err(|_| SignError::VerificationFailed)
+    (true, None)
 }
 
-// ── mazoku ──────────────────────────────────────────────────────────
-
-/// Sign mazoku (organization-level signature).
-///
-/// The signed data is `env_content` followed by `machikado_public_key`,
-/// signed with the organization private key (`org_private_key`).
-/// Returns a 96-byte blob: signature(64) followed by org_public_key(32).
+/// Sign mazoku (organization-level signature), returning a 96-byte [`SignedBlob`].
 ///
 /// # Example
 ///
@@ -134,88 +165,19 @@ pub fn sign_mazoku(
         .map_err(|_| SignError::InvalidPrivateKey)?;
     let org_public_key = signing_key.verifying_key().to_bytes();
 
-    // mazoku signed data: env_content followed by machikado_public_key
     let mut data = Vec::with_capacity(env_content.len() + 32);
     data.extend_from_slice(env_content);
     data.extend_from_slice(machikado_public_key);
 
     let signature = signing_key.sign(&data);
-
-    let mut blob = Vec::with_capacity(96);
-    blob.extend_from_slice(&signature.to_bytes());
-    blob.extend_from_slice(&org_public_key);
-    Ok(blob)
-}
-
-/// Verify mazoku.
-///
-/// Extracts the org public key from the tail of the mazoku blob,
-/// verifies the signature over `env_content` followed by `machikado_public_key`.
-/// The `machikado_public_key` comes from the last 32 bytes of the machikado blob.
-///
-/// A successful verification means the machikado public key is authorized by the org.
-pub fn verify_mazoku(
-    mazoku_blob: &[u8],
-    env_content: &[u8],
-    machikado_public_key: &PublicKey,
-) -> Result<(), SignError> {
-    if mazoku_blob.len() != 96 {
-        return Err(SignError::InvalidBlob);
-    }
-
-    let signature_bytes: &[u8; 64] = mazoku_blob[..64]
-        .try_into()
-        .map_err(|_| SignError::InvalidBlob)?;
-    let org_public_key_bytes: &[u8; 32] = mazoku_blob[64..]
-        .try_into()
-        .map_err(|_| SignError::InvalidBlob)?;
-
-    let signature = Signature::from_bytes(signature_bytes);
-    let verifying_key = VerifyingKey::from_bytes(org_public_key_bytes)
-        .map_err(|_| SignError::VerificationFailed)?;
-
-    let mut data = Vec::with_capacity(env_content.len() + 32);
-    data.extend_from_slice(env_content);
-    data.extend_from_slice(machikado_public_key);
-
-    verifying_key
-        .verify(&data, &signature)
-        .map_err(|_| SignError::VerificationFailed)
-}
-
-/// Full two-tier verification: mazoku first, then machikado.
-///
-/// 1. Extract the member public key from the machikado blob
-/// 2. Verify mazoku (org authorizes this member key)
-/// 3. Verify machikado (files signed by this member)
-///
-/// Fails immediately if any step fails.
-pub fn verify_full(
-    machikado_blob: &[u8],
-    mazoku_blob: &[u8],
-    entries: &[FileEntry],
-    env_content: &[u8],
-) -> Result<(), SignError> {
-    // 1. extract member public key from machikado blob
-    if machikado_blob.len() != 96 {
-        return Err(SignError::InvalidBlob);
-    }
-    let member_pubkey: &PublicKey = machikado_blob[64..]
-        .try_into()
-        .map_err(|_| SignError::InvalidBlob)?;
-
-    // 2. verify mazoku: org authorizes this member key
-    verify_mazoku(mazoku_blob, env_content, member_pubkey)?;
-
-    // 3. verify machikado: files signed by this member
-    verify_signed_blob(entries, machikado_blob)
+    Ok(SignedBlob::new(&signature.to_bytes(), &org_public_key))
 }
 
 fn build_signing_data(entries: &[FileEntry]) -> Vec<u8> {
     let mut data = Vec::new();
     for entry in entries {
         data.extend_from_slice(entry.relative_path.as_bytes());
-        data.push(0); // null terminator
+        data.push(0);
         data.extend_from_slice(&(entry.content.len() as u64).to_le_bytes());
         data.extend_from_slice(&entry.content);
     }
@@ -263,35 +225,46 @@ mod tests {
 
     #[test]
     fn test_sign_and_verify_roundtrip() {
+        let org_kp = generate_keypair();
         let kp = generate_keypair();
         let entries = make_entries();
-        let blob = sign_file_entries(&entries, &kp.private_key).unwrap();
-        assert_eq!(blob.len(), 96);
-        verify_signed_blob(&entries, &blob).unwrap();
+        let machikado = sign_file_entries(&entries, &kp.private_key).unwrap();
+        assert_eq!(machikado.as_bytes().len(), 96);
+        let mazoku = sign_mazoku(b"test", &kp.public_key, &org_kp.private_key).unwrap();
+        assert_eq!(
+            verify(&machikado.as_bytes(), &mazoku.as_bytes(), &entries, b"test"),
+            (true, None)
+        );
     }
 
     #[test]
     fn test_tampered_content_fails() {
+        let org_kp = generate_keypair();
         let kp = generate_keypair();
         let entries = make_entries();
-        let blob = sign_file_entries(&entries, &kp.private_key).unwrap();
+        let machikado = sign_file_entries(&entries, &kp.private_key).unwrap();
+        let mazoku = sign_mazoku(b"test", &kp.public_key, &org_kp.private_key).unwrap();
 
         let mut bad = entries.clone();
         bad[1].content = b"tampered!".to_vec();
-        let err = verify_signed_blob(&bad, &blob).unwrap_err();
-        assert!(matches!(err, SignError::VerificationFailed));
+        let (ok, err) = verify(&machikado.as_bytes(), &mazoku.as_bytes(), &bad, b"test");
+        assert!(!ok);
+        assert_eq!(err, Some(SignError::VerificationFailed));
     }
 
     #[test]
     fn test_tampered_path_fails() {
+        let org_kp = generate_keypair();
         let kp = generate_keypair();
         let entries = make_entries();
-        let blob = sign_file_entries(&entries, &kp.private_key).unwrap();
+        let machikado = sign_file_entries(&entries, &kp.private_key).unwrap();
+        let mazoku = sign_mazoku(b"test", &kp.public_key, &org_kp.private_key).unwrap();
 
         let mut bad = entries.clone();
         bad[1].relative_path = "lib/x86/libzygisk.so".into();
-        let err = verify_signed_blob(&bad, &blob).unwrap_err();
-        assert!(matches!(err, SignError::VerificationFailed));
+        let (ok, err) = verify(&machikado.as_bytes(), &mazoku.as_bytes(), &bad, b"test");
+        assert!(!ok);
+        assert_eq!(err, Some(SignError::VerificationFailed));
     }
 
     #[test]
@@ -307,17 +280,26 @@ mod tests {
 
     #[test]
     fn test_empty_entries() {
+        let org_kp = generate_keypair();
         let kp = generate_keypair();
-        let blob = sign_file_entries(&[], &kp.private_key).unwrap();
-        assert_eq!(blob.len(), 96);
-        verify_signed_blob(&[], &blob).unwrap();
+        let machikado = sign_file_entries(&[], &kp.private_key).unwrap();
+        assert_eq!(machikado.as_bytes().len(), 96);
+        let mazoku = sign_mazoku(b"test", &kp.public_key, &org_kp.private_key).unwrap();
+        assert_eq!(
+            verify(&machikado.as_bytes(), &mazoku.as_bytes(), &[], b"test"),
+            (true, None)
+        );
     }
 
     #[test]
     fn test_invalid_blob_length() {
+        let org_kp = generate_keypair();
+        let kp = generate_keypair();
         let entries = make_entries();
-        let err = verify_signed_blob(&entries, b"too_short").unwrap_err();
-        assert!(matches!(err, SignError::InvalidBlob));
+        let mazoku = sign_mazoku(b"test", &kp.public_key, &org_kp.private_key).unwrap();
+        let (ok, err) = verify(b"too_short", &mazoku.as_bytes(), &entries, b"test");
+        assert!(!ok);
+        assert_eq!(err, Some(SignError::InvalidBlob));
     }
 
     #[test]
@@ -330,20 +312,27 @@ mod tests {
 
     #[test]
     fn test_verify_with_wrong_blob_fails() {
+        let org_kp = generate_keypair();
         let kp1 = generate_keypair();
         let kp2 = generate_keypair();
         let entries = make_entries();
 
-        let blob = sign_file_entries(&entries, &kp1.private_key).unwrap();
-        let blob2 = sign_file_entries(&entries, &kp2.private_key).unwrap();
+        let machikado = sign_file_entries(&entries, &kp1.private_key).unwrap();
+        let machikado2 = sign_file_entries(&entries, &kp2.private_key).unwrap();
+        let mazoku = sign_mazoku(b"test", &kp1.public_key, &org_kp.private_key).unwrap();
 
-        verify_signed_blob(&entries, &blob).unwrap();
+        assert_eq!(
+            verify(&machikado.as_bytes(), &mazoku.as_bytes(), &entries, b"test"),
+            (true, None)
+        );
 
-        let mut hybrid = Vec::from(&blob2[..64]);
-        hybrid.extend_from_slice(&blob[64..]);
-        let err = verify_signed_blob(&entries, &hybrid).unwrap_err();
-        assert!(matches!(err, SignError::VerificationFailed));
+        let mut hybrid = machikado2.signature().to_vec();
+        hybrid.extend_from_slice(machikado.public_key());
+        let (ok, err) = verify(&hybrid, &mazoku.as_bytes(), &entries, b"test");
+        assert!(!ok);
+        assert_eq!(err, Some(SignError::VerificationFailed));
     }
+
     #[test]
     fn test_machikado_and_mazoku_full_flow() {
         let org_kp = generate_keypair();
@@ -351,23 +340,37 @@ mod tests {
         let entries = make_entries();
         let env = b"some_arbitrary_env_data";
         let machikado = sign_file_entries(&entries, &member_kp.private_key).unwrap();
-        assert_eq!(machikado.len(), 96);
+        assert_eq!(machikado.as_bytes().len(), 96);
         let mazoku = sign_mazoku(env, &member_kp.public_key, &org_kp.private_key).unwrap();
-        assert_eq!(mazoku.len(), 96);
-        verify_mazoku(&mazoku, env, &member_kp.public_key).unwrap();
-        verify_signed_blob(&entries, &machikado).unwrap();
-        verify_full(&machikado, &mazoku, &entries, env).unwrap();
+        assert_eq!(mazoku.as_bytes().len(), 96);
+        assert_eq!(
+            verify(&machikado.as_bytes(), &mazoku.as_bytes(), &entries, env),
+            (true, None)
+        );
     }
 
     #[test]
     fn test_mazoku_tampered_env_fails() {
         let org_kp = generate_keypair();
         let member_kp = generate_keypair();
+        let entries = make_entries();
         let env = b"correct_env";
+        let machikado = sign_file_entries(&entries, &member_kp.private_key).unwrap();
         let mazoku = sign_mazoku(env, &member_kp.public_key, &org_kp.private_key).unwrap();
-        let bad_env = b"tampered_env";
-        let err = verify_mazoku(&mazoku, bad_env, &member_kp.public_key).unwrap_err();
-        assert!(matches!(err, SignError::VerificationFailed));
+
+        assert_eq!(
+            verify(&machikado.as_bytes(), &mazoku.as_bytes(), &entries, env),
+            (true, None)
+        );
+
+        let (ok, err) = verify(
+            &machikado.as_bytes(),
+            &mazoku.as_bytes(),
+            &entries,
+            b"tampered_env",
+        );
+        assert!(!ok);
+        assert_eq!(err, Some(SignError::VerificationFailed));
     }
 
     #[test]
@@ -375,32 +378,41 @@ mod tests {
         let org_kp = generate_keypair();
         let member_kp = generate_keypair();
         let other_member = generate_keypair();
+        let entries = make_entries();
         let env = b"some_env";
 
-        let mazoku = sign_mazoku(env, &member_kp.public_key, &org_kp.private_key).unwrap();
+        let machikado = sign_file_entries(&entries, &member_kp.private_key).unwrap();
+        let mazoku = sign_mazoku(env, &other_member.public_key, &org_kp.private_key).unwrap();
 
-        let err = verify_mazoku(&mazoku, env, &other_member.public_key).unwrap_err();
-        assert!(matches!(err, SignError::VerificationFailed));
+        let (ok, err) = verify(&machikado.as_bytes(), &mazoku.as_bytes(), &entries, env);
+        assert!(!ok);
+        assert_eq!(err, Some(SignError::VerificationFailed));
     }
 
     #[test]
     fn test_mazoku_wrong_org_key_fails() {
         let org_kp = generate_keypair();
         let member_kp = generate_keypair();
+        let entries = make_entries();
         let env = b"some_env";
 
+        let machikado = sign_file_entries(&entries, &member_kp.private_key).unwrap();
         let mazoku = sign_mazoku(env, &member_kp.public_key, &org_kp.private_key).unwrap();
 
-        let mut tampered = mazoku.clone();
+        let mut tampered = mazoku.to_vec();
         tampered[80] ^= 0xFF;
-        let err = verify_mazoku(&tampered, env, &member_kp.public_key).unwrap_err();
-        assert!(matches!(err, SignError::VerificationFailed));
+        let (ok, err) = verify(&machikado.as_bytes(), &tampered, &entries, env);
+        assert!(!ok);
+        assert_eq!(err, Some(SignError::VerificationFailed));
 
-        verify_mazoku(&mazoku, env, &member_kp.public_key).unwrap();
+        assert_eq!(
+            verify(&machikado.as_bytes(), &mazoku.as_bytes(), &entries, env),
+            (true, None)
+        );
     }
 
     #[test]
-    fn test_verify_full_mismatched_member_keys() {
+    fn test_verify_mismatched_member_keys() {
         let org_kp = generate_keypair();
         let alice = generate_keypair();
         let bob = generate_keypair();
@@ -410,12 +422,13 @@ mod tests {
         let machikado = sign_file_entries(&entries, &alice.private_key).unwrap();
         let mazoku = sign_mazoku(env, &bob.public_key, &org_kp.private_key).unwrap();
 
-        let err = verify_full(&machikado, &mazoku, &entries, env).unwrap_err();
-        assert!(matches!(err, SignError::VerificationFailed));
+        let (ok, err) = verify(&machikado.as_bytes(), &mazoku.as_bytes(), &entries, env);
+        assert!(!ok);
+        assert_eq!(err, Some(SignError::VerificationFailed));
     }
 
     #[test]
-    fn test_verify_full_tampered_files_after_valid_mazoku() {
+    fn test_verify_tampered_files_after_valid_mazoku() {
         let org_kp = generate_keypair();
         let member_kp = generate_keypair();
         let entries = make_entries();
@@ -424,16 +437,20 @@ mod tests {
         let machikado = sign_file_entries(&entries, &member_kp.private_key).unwrap();
         let mazoku = sign_mazoku(env, &member_kp.public_key, &org_kp.private_key).unwrap();
 
-        verify_full(&machikado, &mazoku, &entries, env).unwrap();
+        assert_eq!(
+            verify(&machikado.as_bytes(), &mazoku.as_bytes(), &entries, env),
+            (true, None)
+        );
 
         let mut bad = entries.clone();
         bad[0].content = b"hacked".to_vec();
-        let err = verify_full(&machikado, &mazoku, &bad, env).unwrap_err();
-        assert!(matches!(err, SignError::VerificationFailed));
+        let (ok, err) = verify(&machikado.as_bytes(), &mazoku.as_bytes(), &bad, env);
+        assert!(!ok);
+        assert_eq!(err, Some(SignError::VerificationFailed));
     }
 
     #[test]
-    fn test_verify_full_bad_mazoku_env() {
+    fn test_verify_bad_mazoku_env() {
         let org_kp = generate_keypair();
         let member_kp = generate_keypair();
         let entries = make_entries();
@@ -442,9 +459,14 @@ mod tests {
         let machikado = sign_file_entries(&entries, &member_kp.private_key).unwrap();
         let mazoku = sign_mazoku(env, &member_kp.public_key, &org_kp.private_key).unwrap();
 
-        // env mismatch → verify_full fails at mazoku stage
-        let err = verify_full(&machikado, &mazoku, &entries, b"wrong_env").unwrap_err();
-        assert!(matches!(err, SignError::VerificationFailed));
+        let (ok, err) = verify(
+            &machikado.as_bytes(),
+            &mazoku.as_bytes(),
+            &entries,
+            b"wrong_env",
+        );
+        assert!(!ok);
+        assert_eq!(err, Some(SignError::VerificationFailed));
     }
 
     /// End-to-end: write machikado + mazoku to a temp dir, then verify from disk.
@@ -456,76 +478,72 @@ mod tests {
         let member_kp = generate_keypair();
         let env = b"some_env_for_signing";
 
-        // Create a temp module directory with real files
         let dir = make_temp_module_dir();
-        // Also create dummy "machikado" and "mazoku" that will be overwritten
         fs::write(dir.join("machikado"), b"placeholder").unwrap();
         fs::write(dir.join("mazoku"), b"placeholder").unwrap();
 
-        // Build time: load files, excluding the sig files themselves
         let entries = load_entries(&dir, &["machikado", "mazoku"]);
         assert!(!entries.is_empty(), "should have module files to sign");
 
-        // Sign machikado and mazoku
         let machikado = sign_file_entries(&entries, &member_kp.private_key).unwrap();
         let mazoku = sign_mazoku(env, &member_kp.public_key, &org_kp.private_key).unwrap();
-        assert_eq!(machikado.len(), 96);
-        assert_eq!(mazoku.len(), 96);
+        assert_eq!(machikado.as_bytes().len(), 96);
+        assert_eq!(mazoku.as_bytes().len(), 96);
 
-        // Write them to disk
-        fs::write(dir.join("machikado"), &machikado).unwrap();
-        fs::write(dir.join("mazoku"), &mazoku).unwrap();
+        fs::write(dir.join("machikado"), machikado.as_bytes()).unwrap();
+        fs::write(dir.join("mazoku"), mazoku.as_bytes()).unwrap();
 
-        // Verify time: read blobs from disk
         let machikado_from_disk = fs::read(dir.join("machikado")).unwrap();
         let mazoku_from_disk = fs::read(dir.join("mazoku")).unwrap();
-        assert_eq!(machikado_from_disk, machikado);
-        assert_eq!(mazoku_from_disk, mazoku);
+        assert_eq!(machikado_from_disk, &machikado.as_bytes()[..]);
+        assert_eq!(mazoku_from_disk, &mazoku.as_bytes()[..]);
 
-        // Reload files (excluding sig files)
         let entries_v = load_entries(&dir, &["machikado", "mazoku"]);
         assert_eq!(entries_v.len(), entries.len());
 
-        // Full two-tier verification
-        verify_full(&machikado_from_disk, &mazoku_from_disk, &entries_v, env).unwrap();
+        assert_eq!(
+            verify(&machikado_from_disk, &mazoku_from_disk, &entries_v, env),
+            (true, None)
+        );
     }
 
     /// Signing with one file excluded produces a different signature
     /// than signing with that file included.
     #[test]
     fn test_ignore_consistency() {
+        let org_kp = generate_keypair();
         let kp = generate_keypair();
         let dir = make_temp_module_dir();
 
-        // Entries with all files (including the sig file placeholder)
         let all = load_entries(&dir, &[]);
-        // Entries excluding "sig.txt"
         let filtered = load_entries(&dir, &["sig.txt"]);
 
         let sig_all = sign_file_entries(&all, &kp.private_key).unwrap();
         let sig_filtered = sign_file_entries(&filtered, &kp.private_key).unwrap();
 
-        // With vs without the extra file → signatures differ
         assert_ne!(sig_all, sig_filtered);
 
-        // Filtered signature verifies against filtered entries
-        verify_signed_blob(&filtered, &sig_filtered).unwrap();
+        let mazoku = sign_mazoku(b"test", &kp.public_key, &org_kp.private_key).unwrap();
+        assert_eq!(
+            verify(
+                &sig_filtered.as_bytes(),
+                &mazoku.as_bytes(),
+                &filtered,
+                b"test"
+            ),
+            (true, None)
+        );
     }
 
-    /// End-to-end test mirroring the user's exact scenario:
-    /// 1. Sign without mapping (like xtask build), ignoring customize.sh & mazoku
-    /// 2. Simulate customize.sh: cp module.prop → module.prop.orig, rm customize.sh
-    /// 3. Modify module.prop (simulating Magisk)
-    /// 4. Write machikado + mazoku to disk
-    /// 5. Verify with mapping (\"module.prop\", \"module.prop.orig\"), ignoring machikado & mazoku
+    /// End-to-end: sign, simulate customize.sh + Magisk modification, verify with mapping.
     #[test]
     fn test_user_scenario_module_prop_backup() {
         use crate::{FileMapping, load_folder_files};
         use std::fs;
 
+        let org_kp = generate_keypair();
         let member_kp = generate_keypair();
 
-        // ── 1. Set up source directory (like module/ before build) ──
         let dir = std::env::temp_dir().join(format!("machikado_user_test_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
@@ -544,31 +562,27 @@ mod tests {
         fs::write(dir.join("config.toml"), b"key = \"value\"\n").unwrap();
         fs::write(dir.join("webroot/index.html"), b"<html></html>\n").unwrap();
 
-        // ── 2. Sign: like xtask build (no mapping, ignore customize.sh & mazoku) ──
         let entries_sign = load_folder_files(&dir, &[], &["customize.sh", "mazoku"], None).unwrap();
         assert!(!entries_sign.is_empty());
         let machikado = sign_file_entries(&entries_sign, &member_kp.private_key).unwrap();
+        let mazoku = sign_mazoku(b"test", &member_kp.public_key, &org_kp.private_key).unwrap();
 
-        // ── 3. Simulate customize.sh: backup module.prop, delete customize.sh ──
         fs::copy(dir.join("module.prop"), dir.join("module.prop.orig")).unwrap();
         fs::remove_file(dir.join("customize.sh")).ok();
 
-        // ── 4. Simulate Magisk modifying module.prop ──
         fs::write(
             dir.join("module.prop"),
             b"id=test\nname=Test (NXT)\nversion=v1.0\n",
         )
         .unwrap();
 
-        // ── 5. Write machikado to disk ──
-        fs::write(dir.join("machikado"), &machikado).unwrap();
+        fs::write(dir.join("machikado"), machikado.as_bytes()).unwrap();
+        fs::write(dir.join("mazoku"), mazoku.as_bytes()).unwrap();
 
-        // ── 6. Verify: like misc.rs (mapping module.prop ← module.prop.orig, ignore machikado & mazoku) ──
         let mapping = FileMapping::from(("module.prop", "module.prop.orig"));
         let entries_verify =
             load_folder_files(&dir, &[], &["machikado", "mazoku"], Some(&mapping)).unwrap();
 
-        // The entries should be identical (same count, same paths in same order)
         assert_eq!(
             entries_verify.len(),
             entries_sign.len(),
@@ -588,7 +602,14 @@ mod tests {
             );
         }
 
-        // Full machikado verification should pass
-        verify_signed_blob(&entries_verify, &machikado).unwrap();
+        assert_eq!(
+            verify(
+                &machikado.as_bytes(),
+                &mazoku.as_bytes(),
+                &entries_verify,
+                b"test"
+            ),
+            (true, None)
+        );
     }
 }

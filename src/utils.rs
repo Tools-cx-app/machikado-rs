@@ -1,4 +1,4 @@
-//! File utilities: folder traversal, sorting, and path mapping.
+//! File traversal, sorting, and path mapping.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -6,27 +6,19 @@ use walkdir::WalkDir;
 
 use crate::sign::FileEntry;
 
-/// File mapping table: defines how source paths map to final paths.
+/// Path mapping: final path → source path on disk.
 ///
-/// Used when a Magisk module's `customize.sh` moves files during installation
-/// (e.g. architecture-specific paths → generic paths).
-/// key = final path (path signed into machikado), value = source path (actual file on disk).
+/// Used when `customize.sh` moves files (e.g. arch-specific → generic).
 ///
 /// # Example
 ///
 /// ```ignore
-/// // Single mapping (most concise)
 /// let mapping = FileMapping::from(("bin/zygiskd64", "bin/arm64-v8a/zygiskd"));
 ///
-/// // Multiple mappings
 /// let mapping = FileMapping::from([
 ///     ("bin/zygiskd64", "bin/arm64-v8a/zygiskd"),
 ///     ("lib/libzygisk.so", "lib/armeabi-v7a/libzygisk.so"),
 /// ]);
-///
-/// // Builder style (still available)
-/// let mut mapping = FileMapping::new();
-/// mapping.insert("bin/zygiskd64", "bin/arm64-v8a/zygiskd");
 /// ```
 #[derive(Debug, Clone, Default)]
 pub struct FileMapping {
@@ -34,37 +26,27 @@ pub struct FileMapping {
 }
 
 impl FileMapping {
-    /// Create an empty mapping.
     pub fn new() -> Self {
         Self {
             map: BTreeMap::new(),
         }
     }
 
-    /// Add a mapping entry.
-    ///
-    /// `target_path`: final path (path on device, used for sorting and signing).
-    /// `source_path`: source path (actual file location in the module directory).
     pub fn insert(&mut self, target_path: &str, source_path: &str) {
         self.map
             .insert(target_path.to_string(), source_path.to_string());
     }
 
-    /// Number of entries in the mapping.
     pub fn len(&self) -> usize {
         self.map.len()
     }
 
-    /// Whether the mapping is empty.
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
     }
 }
 
-// ── Convenience constructors ───────────────────────────────────────
-
 impl From<(&str, &str)> for FileMapping {
-    /// Create a mapping from a single `(target_path, source_path)` pair.
     fn from((target, source): (&str, &str)) -> Self {
         let mut m = Self::new();
         m.insert(target, source);
@@ -73,8 +55,17 @@ impl From<(&str, &str)> for FileMapping {
 }
 
 impl<const N: usize> From<[(&str, &str); N]> for FileMapping {
-    /// Create a mapping from a fixed-size array of `(target_path, source_path)` pairs.
     fn from(pairs: [(&str, &str); N]) -> Self {
+        let mut m = Self::new();
+        for (target, source) in pairs {
+            m.insert(target, source);
+        }
+        m
+    }
+}
+
+impl From<Vec<(&str, &str)>> for FileMapping {
+    fn from(pairs: Vec<(&str, &str)>) -> Self {
         let mut m = Self::new();
         for (target, source) in pairs {
             m.insert(target, source);
@@ -93,28 +84,19 @@ impl FromIterator<(String, String)> for FileMapping {
     }
 }
 
-/// Recursively load all files from a folder, sorted by relative path (using `/` separator).
+/// Load and sort all files under `folder`, with optional path mapping and ignore rules.
 ///
-/// `mapping`: optional file mapping. When provided, mapped entries take priority:
-/// the final path becomes [`FileEntry::relative_path`] and content is read from the
-/// source path. The directory walk skips source paths already covered by the mapping
-/// to avoid duplicates. Pass `None` for the original behaviour.
-///
-/// `ignore_prefixes`: relative path prefixes to skip (e.g. `["subdir_to_skip"]`).
-/// `ignore_names`: exact relative paths to skip (e.g. `["machikado", "mazoku"]`).
-///
-/// Sort order matches ZygiskNext's `TreeSet` behavior (lexicographic string sort).
+/// `ignore_prefixes`: relative path prefixes to skip.
+/// `ignore_names`: exact relative paths to skip.
+/// `mapping`: optional [`FileMapping`]; mapped entries take priority.
 ///
 /// # Example
 ///
 /// ```ignore
-/// // Without mapping (same as before)
-/// let entries = machikado_rs::load_folder_files(module_dir, &[], &["machikado", "mazoku"], None)?;
+/// let entries = machikado_rs::load_folder_files(dir, &[], &["machikado", "mazoku"], None)?;
 ///
-/// // With mapping
-/// let mut mapping = machikado_rs::FileMapping::new();
-/// mapping.insert("bin/zygiskd64", "bin/arm64-v8a/zygiskd");
-/// let entries = machikado_rs::load_folder_files(module_dir, &[], &["machikado", "mazoku"], Some(&mapping))?;
+/// let mapping = FileMapping::from(("bin/zygiskd64", "bin/arm64-v8a/zygiskd"));
+/// let entries = machikado_rs::load_folder_files(dir, &[], &["machikado", "mazoku"], Some(&mapping))?;
 /// ```
 pub fn load_folder_files(
     folder: &Path,
@@ -124,7 +106,6 @@ pub fn load_folder_files(
 ) -> std::io::Result<Vec<FileEntry>> {
     let mut entries = Vec::new();
 
-    // ── 1. Process mapped entries ──────────────────────────────────
     if let Some(m) = mapping {
         for (target_path, source_path) in &m.map {
             let full_source = folder.join(source_path);
@@ -144,7 +125,6 @@ pub fn load_folder_files(
         }
     }
 
-    // ── 2. Walk directory for unmapped files ───────────────────────
     for entry in WalkDir::new(folder)
         .sort_by_file_name()
         .into_iter()
@@ -160,18 +140,15 @@ pub fn load_folder_files(
             .to_string_lossy()
             .replace('\\', "/");
 
-        // Skip paths already covered by the mapping (both source and target)
         if let Some(m) = mapping
             && (m.map.values().any(|s| s == &relative_path) || m.map.contains_key(&relative_path))
         {
             continue;
         }
 
-        // Check prefix-based ignore
         if ignore_prefixes.iter().any(|p| relative_path.starts_with(p)) {
             continue;
         }
-        // Check exact-name ignore
         if ignore_names.iter().any(|n| relative_path == *n) {
             continue;
         }
@@ -183,7 +160,6 @@ pub fn load_folder_files(
         });
     }
 
-    // ── 3. Sort by final path ──────────────────────────────────────
     entries.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
 
     Ok(entries)
@@ -221,7 +197,6 @@ mod tests {
         write_file(&dir, "skip/config.txt", b"skip");
         write_file(&dir, "skip/nested/data.bin", b"data");
 
-        // Exclude the "skip/" prefix
         let entries = load_folder_files(&dir, &["skip"], &[], None).unwrap();
         let paths: Vec<&str> = entries.iter().map(|e| e.relative_path.as_str()).collect();
         assert_eq!(paths, vec!["keep.txt"]);
@@ -236,7 +211,6 @@ mod tests {
         write_file(&dir, "b.txt", b"b");
         write_file(&dir, "sub/c.txt", b"c");
 
-        // Exclude a specific file by exact name
         let entries = load_folder_files(&dir, &[], &["b.txt"], None).unwrap();
         let paths: Vec<&str> = entries.iter().map(|e| e.relative_path.as_str()).collect();
         assert_eq!(paths, vec!["a.txt", "sub/c.txt"]);
@@ -251,7 +225,6 @@ mod tests {
         write_file(&dir, "skip_prefix/data.txt", b"d");
         write_file(&dir, "skip_exact.txt", b"e");
 
-        // Both prefix and exact-name ignores work together
         let entries = load_folder_files(&dir, &["skip_prefix"], &["skip_exact.txt"], None).unwrap();
         let paths: Vec<&str> = entries.iter().map(|e| e.relative_path.as_str()).collect();
         assert_eq!(paths, vec!["keep.txt"]);
@@ -277,7 +250,6 @@ mod tests {
         let dir = temp_dir();
         let _guard = Cleanup(Some(dir.clone()));
 
-        // Source directory has arch-specific subdirectories
         write_file(&dir, "bin/arm64-v8a/zygiskd", b"d64");
         write_file(&dir, "bin/armeabi-v7a/zygiskd", b"d32");
         write_file(&dir, "module.prop", b"prop");
@@ -291,7 +263,6 @@ mod tests {
         let paths: Vec<&str> = entries.iter().map(|e| e.relative_path.as_str()).collect();
         let contents: Vec<&[u8]> = entries.iter().map(|e| e.content.as_slice()).collect();
 
-        // Mapped files appear under their final path; unmapped files as-is; sorted by final path
         assert_eq!(
             paths,
             vec![
@@ -318,7 +289,6 @@ mod tests {
         let entries = load_folder_files(&dir, &[], &[], Some(&mapping)).unwrap();
         let paths: Vec<&str> = entries.iter().map(|e| e.relative_path.as_str()).collect();
 
-        // Source path bin/arm64-v8a/zygiskd must not appear (mapping covers it)
         assert_eq!(paths, vec!["bin/zygiskd64", "module.prop"]);
     }
 
@@ -359,8 +329,6 @@ mod tests {
         let dir = temp_dir();
         let _guard = Cleanup(Some(dir.clone()));
 
-        // Both the target and source physically exist — like module.prop and
-        // module.prop.orig after customize.sh copies the original.
         write_file(&dir, "module.prop", b"modified");
         write_file(&dir, "module.prop.orig", b"original");
 
@@ -370,18 +338,14 @@ mod tests {
         let paths: Vec<&str> = entries.iter().map(|e| e.relative_path.as_str()).collect();
         let contents: Vec<&[u8]> = entries.iter().map(|e| e.content.as_slice()).collect();
 
-        // Only one "module.prop" entry, with content from .orig
         assert_eq!(paths, vec!["module.prop"]);
         assert_eq!(contents, vec![b"original" as &[u8]]);
     }
 
-    /// RAII guard to clean up temp dir on drop
     struct Cleanup(Option<std::path::PathBuf>);
     impl Drop for Cleanup {
         fn drop(&mut self) {
-            if let Some(_dir) = self.0.take() {
-                // let _ = fs::remove_dir_all(&dir);
-            }
+            if let Some(_dir) = self.0.take() {}
         }
     }
 }
