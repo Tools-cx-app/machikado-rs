@@ -32,7 +32,11 @@ impl FileMapping {
         }
     }
 
-    pub fn insert(&mut self, target_path: &str, source_path: &str) {
+    pub fn insert<T, S>(&mut self, target_path: T, source_path: S)
+    where
+        T: ToString,
+        S: ToString,
+    {
         self.map
             .insert(target_path.to_string(), source_path.to_string());
     }
